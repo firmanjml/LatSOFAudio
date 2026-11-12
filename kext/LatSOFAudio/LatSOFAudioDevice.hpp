@@ -52,11 +52,12 @@ enum {
 #define kLatSOF_BufferFrames    16384
 #define kLatSOF_BytesPerFrame   4       // S16 stereo (playback)
 #define kLatSOF_BufferSize      (kLatSOF_BufferFrames * kLatSOF_BytesPerFrame)
-// DMIC capture: 2ch S32 @ 48 kHz — this driver's DMA format (SDxFMT 0x0041,
-// 32-bit container). Linux hw_params for the same PCM negotiates S16/2ch;
-// the earlier "4ch" claim here was from the reference driver's board.
-#define kLatSOF_CapChannels     2
-#define kLatSOF_CapBytesPerFrame (kLatSOF_CapChannels * 4)  // 8 (2ch × S32)
+// HP 8549 DMIC0 capture: PDM0 A/B and PDM1 A/B, interleaved S32 at 48 kHz.
+constexpr UInt32 kLatSOF_CapChannels = 4;
+constexpr UInt32 kLatSOF_CapRate = 48000;
+constexpr UInt32 kLatSOF_CapSampleBytes = sizeof(SInt32);
+constexpr UInt16 kLatSOF_CapHdaFormat = 0x0040 | (kLatSOF_CapChannels - 1);
+constexpr UInt32 kLatSOF_CapBytesPerFrame = kLatSOF_CapChannels * kLatSOF_CapSampleBytes;
 #define kLatSOF_CapBufferSize   (kLatSOF_BufferFrames * kLatSOF_CapBytesPerFrame)
 
 class LatSOFAudioUserClient;
@@ -126,6 +127,8 @@ private:
     int sIdx;                  // playback stream index
     UInt32 sTag, sd;           // playback stream tag & SD offset
     int capIdx;                // capture stream index
+    bool capEnabledProcessing; // capture enabled PPCTL.GPROCEN for this session
+    void releaseCaptureStream();
     UInt32 capTag, capSd;      // capture stream tag & SD offset
     UInt32 outboxOff;
     bool hwReady;

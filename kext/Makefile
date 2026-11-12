@@ -68,11 +68,13 @@ $(KEXT_BUNDLE): $(OBJS)
 	cp $(SRCDIR)/Info.plist $(KEXT_BUNDLE)/Contents/
 	@echo "=== Build complete: $(KEXT_BUNDLE) ==="
 
+$(SRCS:.cpp=.o): $(SRCDIR)/LatSOFAudioDevice.hpp $(SRCDIR)/LatSOFKernelAudio.hpp
+
 %.o: %.cpp
 	@echo "=== Compiling $< ==="
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(SRCDIR)/sof_firmware_embed.o: $(SRCDIR)/sof_firmware_embed.s $(SRCDIR)/Firmware/sof-cml.ri
+$(SRCDIR)/sof_firmware_embed.o: $(SRCDIR)/sof_firmware_embed.s $(SRCDIR)/Firmware/sof-cnl.ri
 	@echo "=== Embedding firmware ==="
 	$(AS) $(ASFLAGS) -c $< -o $@
 

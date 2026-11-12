@@ -17,12 +17,11 @@
 //
 
 #include "LatSOFKernelAudio.hpp"
-#include "LatSOFAudioDevice.hpp"
 #include <IOKit/IOLib.h>
 
-#define kEngineSampleRate   48000
-#define kEngineChannels     2
-#define kEngineBitDepth     32
+#define kEngineSampleRate   kLatSOF_CapRate
+#define kEngineChannels     kLatSOF_CapChannels
+#define kEngineBitDepth     (kLatSOF_CapSampleBytes * 8)
 #define kEngineFrames       kLatSOF_BufferFrames        // 16384, shared ring
 #define kWrapPollMS         100
 #define kDCSeedPending      0xFFFFFFFFu   // dcNextFrame: seed from first IO request
@@ -49,8 +48,8 @@ bool LatSOFKernelAudioDevice::initHardware(IOService *provider) {
 
     setDeviceName("LatSOF Internal Microphone");
     setDeviceShortName("LatSOF Mic");
-    setManufacturerName("Dell Latitude 3410");
-    setDeviceModelName("LatSOF Internal Microphone");
+    setManufacturerName("HP");
+    setDeviceModelName("EliteBook 840 G6");
     // Built-in transport, and see createControls(): CoreSpeech routes a
     // 'bltn' device only if its input-scope data source reads 'imic'. The
     // earlier belief that Siri filtered on device class (kernel vs
@@ -90,7 +89,8 @@ bool LatSOFKernelAudioEngine::initWithOwner(LatSOFAudioDevice *o) {
     lastWrapFrame = 0;
     engineRunning = false;
     gainMilliDecibels = 30000;   // +30 dB ≈ the plugin's 32x software gain
-    dcX1[0] = dcX1[1] = dcY1[0] = dcY1[1] = 0.0f;
+    bzero(dcX1, sizeof(dcX1));
+    bzero(dcY1, sizeof(dcY1));
     dcNextFrame = kDCSeedPending;
     edgeMisses = notReadyPolls = preemptRejects = 0;
     AbsoluteTime zero = 0;
@@ -335,7 +335,8 @@ IOReturn LatSOFKernelAudioEngine::performAudioEngineStart() {
     IOReturn r = owner->engineStartCapture();
     if (r != kIOReturnSuccess) return r;
 
-    dcX1[0] = dcX1[1] = dcY1[0] = dcY1[1] = 0.0f;
+    bzero(dcX1, sizeof(dcX1));
+    bzero(dcY1, sizeof(dcY1));
     dcNextFrame = kDCSeedPending;
     // If capture was already running (isCapturing early-success — e.g. a
     // client retry after the wake window), DPIB is mid-ring: declare t0
@@ -537,7 +538,9 @@ IOReturn LatSOFKernelAudioEngine::convertInputSamples(const void *sampleBuf, voi
     if (dcNextFrame == kDCSeedPending)
         dcNextFrame = firstSampleFrame;
     bool contiguous = (firstSampleFrame == dcNextFrame);
-    float x1[2] = { dcX1[0], dcX1[1] }, y1[2] = { dcY1[0], dcY1[1] };
+    float x1[kEngineChannels], y1[kEngineChannels];
+    memcpy(x1, dcX1, sizeof(x1));
+    memcpy(y1, dcY1, sizeof(y1));
 
     const float R = 0.98822f;   // ~90 Hz corner at 48 kHz, same as plugin
     for (UInt32 i = 0; i < numSampleFrames; i++) {
@@ -556,8 +559,8 @@ IOReturn LatSOFKernelAudioEngine::convertInputSamples(const void *sampleBuf, voi
         }
     }
     if (contiguous) {
-        dcX1[0] = x1[0]; dcX1[1] = x1[1];
-        dcY1[0] = y1[0]; dcY1[1] = y1[1];
+        memcpy(dcX1, x1, sizeof(dcX1));
+        memcpy(dcY1, y1, sizeof(dcY1));
         dcNextFrame = (firstSampleFrame + numSampleFrames) % kEngineFrames;
     }
     return kIOReturnSuccess;

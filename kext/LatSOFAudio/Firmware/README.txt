@@ -1,1 +1,1 @@
-Place sof-cml.ri here — see README. Not redistributed in this repo.
+Place Intel-signed IPC3 sof-cnl.ri here. Use the firmware matched to the HP840G6 port notes.

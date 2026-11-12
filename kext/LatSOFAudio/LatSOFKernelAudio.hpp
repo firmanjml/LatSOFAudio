@@ -31,8 +31,8 @@
 #include <IOKit/audio/IOAudioLevelControl.h>
 #include <IOKit/audio/IOAudioToggleControl.h>
 #include <IOKit/audio/IOAudioSelectorControl.h>
+#include "LatSOFAudioDevice.hpp"
 
-class LatSOFAudioDevice;
 class LatSOFKernelAudioEngine;
 
 // Thin IOAudioDevice: exists so IOAudioFamily has a device node to hang the
@@ -115,7 +115,7 @@ private:
     // raw PDM data carries a DC offset, and filtering before gain keeps the
     // offset from eating headroom. State is per-channel.
     SInt32 gainMilliDecibels;           // set by the level control
-    float dcX1[2], dcY1[2];
+    float dcX1[kLatSOF_CapChannels], dcY1[kLatSOF_CapChannels];
     UInt32 dcNextFrame;                 // multi-client guard; kDCSeedPending until first IO
 
     // patch-29 clock accuracy. DPIB is not a continuous counter: it advances

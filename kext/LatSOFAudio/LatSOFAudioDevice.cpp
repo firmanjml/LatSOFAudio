@@ -130,10 +130,8 @@ extern "C" const unsigned long long sof_fw_size;
 // Vendor Specific Registers
 #define HDA_VS_SDXDPIB_XBASE    0x1084  // DPIB register base (playback position)
 #define HDA_VS_SDXDPIB_XINTERVAL 0x20   // DPIB register interval per stream
-#define HDA_VS_EM2          0x1030  // Extended Mode 2
 
 // PCI Config registers
-#define PCI_TCSEL           0x44    // Traffic Class Select
 
 // DesignWare I2C controller registers (BAR0 of PCI 8086:02c5)
 #define DW_IC_CON           0x00
@@ -332,11 +330,8 @@ static int gRecoveryEpisodes = 0;
 // descriptor before borrowing it anyway. 20 rounds = ~30 s: long enough for
 // an idle engine to be torn down, short enough that a wake never costs the
 // microphone for more than half a minute.
-#define kProgrammedWaitRounds 20
-static int  gProgrammedWaits = 0;
 // Escape hatch, per the patch-28 lesson: latsof_strictborrow=0 restores the
 // old RUN-bit-only preflight without a rebuild.
-static bool gStrictBorrow = true;
 
 // patch-30 fix 1: deferred engine-resume latch (see engineRequestResume).
 // Same single-writer discipline as the other latches in this file: set and
@@ -345,15 +340,6 @@ static bool gStrictBorrow = true;
 static bool gEngineResumePending = false;
 static int  gEngineResumeTries   = 0;
 
-// patch-32: HOT vs COLD rebuilds need different borrow policies, and one
-// boot-arg cannot express both. Evidence: with latsof_strictborrow=0, three
-// cold wakes borrowed a programmed SD7 instantly and worked every time —
-// but a rebuild during live session churn (the device-switch wedge) burned
-// all 12 tries on "FAILED: ROM IPC timeout", the documented signature of
-// borrowing a programmed descriptor whose session is still hot. So: wake
-// rebuilds honor the boot-arg (fast), while rebuilds triggered by IPC
-// timeouts or capture demands wait for a clean window regardless of it.
-static bool gHotRecovery = false;
 // And never again lose WHY the retries failed: the give-up status used to
 // overwrite the last initDSP failure reason.
 static char gLastInitFail[40] = "";
@@ -372,14 +358,26 @@ static bool poll32(volatile UInt8 *b, UInt32 o, UInt32 mask, UInt32 val, UInt32 
 // 2 programmed (CBL/BDL live — RUN clear is not enough, see the jackPoll
 // comment: FIFO and DMA position are not register state and cannot be handed
 // back to a stream AppleHDA already programmed).
+static bool streamIsProgrammed(volatile UInt8 *hda, UInt32 offset) {
+    return (rd32(hda, offset) & 0x00F0001F) ||
+           rd32(hda, offset + SD_REG_CBL) ||
+           rd32(hda, offset + SD_REG_BDLPL) || rd32(hda, offset + SD_REG_BDLPU) ||
+           rd16(hda, offset + SD_REG_LVI) || rd16(hda, offset + SD_REG_FMT);
+}
+
 static int outputSdBusyState(volatile UInt8 *hda, UInt16 *gcapOut = nullptr) {
-    UInt16 g = rd16(hda, HDA_GCAP);
-    if (gcapOut) *gcapOut = g;   // callers log the value the DECISION used
-    if (g == 0xFFFF || g == 0x0000) return -1;
-    UInt32 o = SD_BASE + (UInt32)((g >> 8) & 0xF) * SD_SIZE;
-    if (rd8(hda, o) & SD_CTL_RUN) return 1;
-    if (rd32(hda, o + SD_REG_CBL) || rd32(hda, o + SD_REG_BDLPL) ||
-        rd32(hda, o + SD_REG_BDLPU)) return 2;
+    const UInt16 gcap = rd16(hda, HDA_GCAP);
+    if (gcapOut) *gcapOut = gcap;
+    const UInt32 inputs = (gcap >> 8) & 0xF;
+    const UInt32 outputs = (gcap >> 12) & 0xF;
+    if (gcap == 0xFFFF || !inputs || !outputs) return -1;
+
+    const UInt32 loader = SD_BASE + inputs * SD_SIZE;
+    for (UInt32 i = 0; i < outputs; ++i) {
+        if (rd8(hda, loader + i * SD_SIZE) & SD_CTL_RUN) return 1;
+    }
+    if (streamIsProgrammed(hda, loader) || (rd32(hda, HDA_INTCTL) & (1U << inputs)))
+        return 2;
     return 0;
 }
 
@@ -447,7 +445,7 @@ static int outputSdBusyState(volatile UInt8 *hda, UInt16 *gcapOut = nullptr) {
 #define kAfgBeltTicks       20      // RUN belt check: every 20th 500 ms tick
 #define kAfgIciFailLimit    8       // consecutive ICI failures -> retire
 
-static bool gAfgKextWake  = true;   // boot-arg latsof_afgwake=0 disables
+static constexpr bool gAfgKextWake = false; // Dell ALC236 workaround is not used on ALC215.
 static int  gAfgLastSd    = -2;     // last outputSdBusyState (-2 = unseen)
 static UInt32 gAfgLastSig = 0;      // last BDL^CBL^FMT signature of SD7
 static int  gAfgSenseTick = 0;      // jack-sense poll divider
@@ -528,9 +526,15 @@ static void sdRestore(volatile UInt8 *hda, UInt32 sd, UInt32 sIdx,
     wr8(hda, sd + 2,  (UInt8)((s.ctl >> 16) & 0xFF));
     if (spibCap) {
         wr32(hda, spibCap + 0x08 + sIdx * 0x08, s.spibVal);
-        wr32(hda, spibCap + 0x04, s.spibEn);
+        const UInt32 mask = 1U << sIdx;
+        const UInt32 current = rd32(hda, spibCap + 0x04);
+        wr32(hda, spibCap + 0x04, (current & ~mask) | (s.spibEn & mask));
     }
-    if (ppCap) wr32(hda, ppCap + PP_PPCTL, s.ppctl);
+    if (ppCap) {
+        const UInt32 mask = PP_PPCTL_GPROCEN | (1U << sIdx);
+        const UInt32 current = rd32(hda, ppCap + PP_PPCTL);
+        wr32(hda, ppCap + PP_PPCTL, (current & ~mask) | (s.ppctl & mask));
+    }
 }
 
 // Power states for sleep/wake
@@ -548,6 +552,7 @@ bool LatSOFAudioDevice::init(OSDictionary *d) {
     ppCap = 0; spibCap = 0;
     sIdx = 0; sTag = 0; sd = 0;
     capIdx = 0; capTag = 0; capSd = 0;
+    capEnabledProcessing = false;
     outboxOff = 0;
     hwReady = false; isPlaying = false; isCapturing = false;
     lastJackState = false; jackTimer = nullptr;
@@ -566,7 +571,7 @@ void LatSOFAudioDevice::free() {
 
 IOService *LatSOFAudioDevice::probe(IOService *provider, SInt32 *score) {
     // LATITUDE FORK: the provider is IOResources, not the PCI device, because
-    // AppleHDA owns 8086:02c8 and must keep owning it. The original body cast
+    // AppleHDA owns the shared controller and must keep owning it. The original body cast
     // the provider to IOPCIDevice and bailed out, so start() was never called.
     // Device discovery and validation now happen in start() via a registry walk.
     if (!IOService::probe(provider, score)) return nullptr;
@@ -592,7 +597,9 @@ bool LatSOFAudioDevice::start(IOService *provider) {
                 IOPCIDevice *c = OSDynamicCast(IOPCIDevice, o);
                 if (!c) continue;
                 if (c->configRead16(kIOPCIConfigVendorID) == 0x8086 &&
-                    c->configRead16(kIOPCIConfigDeviceID) == 0x02c8) {
+                    c->configRead16(kIOPCIConfigDeviceID) == 0x9dc8 &&
+                    c->configRead16(0x2c) == 0x103c && // PCI subsystem vendor
+                    c->configRead16(0x2e) == 0x8549) { // PCI subsystem device
                     pciDevice = c; pciDevice->retain(); break;
                 }
             }
@@ -603,41 +610,17 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     IOLog("LatSOF: found cAVS: %s\n", pciDevice->getName());
     // NOTE: no pciDevice->open() — AppleHDA holds it.
 
-    pciDevice->setIOEnable(true);
-    pciDevice->setBusMasterEnable(true);
-    pciDevice->setMemoryEnable(true);
-    // LATITUDE FORK: D3->D0 power cycle removed (AppleHDA owns power state)
-
-    // TCSEL: clear TC bits [2:0] to TC0 (like Linux snd_intel_dsp_driver_probe)
-    {
-        UInt8 tcsel = pciDevice->configRead8(PCI_TCSEL);
-        pciDevice->configWrite8(PCI_TCSEL, tcsel & ~0x07);
-    }
-    // Disable PCI interrupt (CMD bit 10)
-    {
-        UInt16 cmd = pciDevice->configRead16(0x04);
-        pciDevice->configWrite16(0x04, cmd | 0x0400);
-    }
+    // PCI command bits, interrupt routing and device power belong to AppleHDA.
 
     hdaBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
     dspBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4);
-    if (!hdaBarMap || !dspBarMap) {
-        setProperty("Status", "FAILED: BAR map"), IOLog("LatSOF: %s\n", "FAILED: BAR map");
+    if (!hdaBarMap || !dspBarMap ||
+        hdaBarMap->getLength() < 0x4000 || dspBarMap->getLength() < 0x100000) {
+        setProperty("Status", "FAILED: CNL BAR map or size");
         goto fail;
     }
     hdaBase = (volatile UInt8 *)hdaBarMap->getVirtualAddress();
     dspBase = (volatile UInt8 *)dspBarMap->getVirtualAddress();
-
-    {   // patch-30 escape hatch (see the preflight in jackPoll)
-        UInt32 sb = 1;
-        if (PE_parse_boot_argn("latsof_strictborrow", &sb, sizeof(sb)))
-            gStrictBorrow = (sb != 0);
-        // patch-31 escape hatch: latsof_afgwake=0 reverts the AFG keep-alive
-        // to the userland daemon without a rebuild.
-        UInt32 aw = 1;
-        if (PE_parse_boot_argn("latsof_afgwake", &aw, sizeof(aw)))
-            gAfgKextWake = (aw != 0);
-    }
 
     // patch-30 fix 2: allocate the capture ring here, not in initDSP. This
     // is what lets the load path DEFER initDSP (below) and still publish the
@@ -648,8 +631,11 @@ bool LatSOFAudioDevice::start(IOService *provider) {
         if (!capDmaBuf) {
             capDmaBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
                 kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
-                kLatSOF_CapBufferSize, 0xFFFFFFFFFFFFF000ULL);
-            if (capDmaBuf) capDmaBuf->prepare();
+                kLatSOF_CapBufferSize, 0x00000000FFFFF000ULL);
+            if (capDmaBuf && capDmaBuf->prepare() != kIOReturnSuccess) {
+                capDmaBuf->release();
+                capDmaBuf = nullptr;
+            }
         }
         // review 1 Aug: BDL only if the ring exists (same rule as initDSP's
         // copy — see the comment there).
@@ -658,8 +644,11 @@ bool LatSOFAudioDevice::start(IOService *provider) {
             UInt32 bdlSz = ((numBdl * 16) + 127) & ~127U;
             capBdlBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
                 kIOMemoryPhysicallyContiguous | kIODirectionInOut, bdlSz, 0xFFFFFFFFFFFFFF80ULL);
-            if (capBdlBuf && capDmaBuf) {
-                capBdlBuf->prepare();
+            if (capBdlBuf && capBdlBuf->prepare() != kIOReturnSuccess) {
+                capBdlBuf->release();
+                capBdlBuf = nullptr;
+            }
+            if (capBdlBuf) {
                 HdaBdlEntry *cbdl = (HdaBdlEntry *)capBdlBuf->getBytesNoCopy();
                 memset(cbdl, 0, bdlSz);
                 UInt64 cphys = capDmaBuf->getPhysicalAddress();
@@ -668,7 +657,7 @@ bool LatSOFAudioDevice::start(IOService *provider) {
                     UInt32 chunk = (crem > PAGE_SIZE) ? PAGE_SIZE : crem;
                     cbdl[i].addrLow = (UInt32)(cphys & 0xFFFFFFFF);
                     cbdl[i].addrHigh = (UInt32)(cphys >> 32);
-                    cbdl[i].size = chunk; cbdl[i].ioc = 1;
+                    cbdl[i].size = chunk; cbdl[i].ioc = 0;
                     crem -= chunk; cphys += chunk;
                 }
             }
@@ -698,20 +687,15 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     // so its own GCAP wait and failure reporting still hard-fail start().
     {
         int st = outputSdBusyState(hdaBase);
-        bool deferInit = (st == 1) || (st == 2 && gStrictBorrow);
+        const bool deferInit = (st == 1 || st == 2);
         if (deferInit) {
             gWakeReinitPending = true;
             gWakeTries = 0;
             gWakeTickDivider = 0;
-            gProgrammedWaits = 0;
-            gHotRecovery = true;   // patch-32: deferred BECAUSE audio was live
             setProperty("Status", "deferred: AppleHDA output busy at load");
             IOLog("LatSOF: AppleHDA output %s at load — deferring DSP init "
                   "to the retry engine (watch Wake-Retry / Status)\n",
                   (st == 1) ? "RUNNING" : "programmed");
-        } else if (st == 2) {
-            IOLog("LatSOF: %s\n", "output programmed at load but "
-                  "latsof_strictborrow=0 — borrowing anyway");
         } else if (st == -1) {
             IOLog("LatSOF: %s\n", "controller not decoding at load — "
                   "initDSP will wait/report as before");
@@ -723,9 +707,8 @@ bool LatSOFAudioDevice::start(IOService *provider) {
                 // deferral as the preflight's own; retry engine takes over.
                 gWakeTries = 0;
                 gWakeTickDivider = 0;
-                gProgrammedWaits = 0;
             } else {
-                setProperty("Status", "FAILED: DSP init"), IOLog("LatSOF: %s\n", "FAILED: DSP init");
+                IOLog("LatSOF: DSP init failed (see Status)\n");
                 goto fail;
             }
         }
@@ -777,8 +760,7 @@ bool LatSOFAudioDevice::start(IOService *provider) {
     }
 
     // kernel-mic: publish the capture ring as a kernel audio device.
-    // Non-fatal on failure — capture still works through the UserClient —
-    // but log loudly, because Siri visibility is the entire point.
+    // Publish capture exclusively through the kernel audio engine.
     kernelAudio = new LatSOFKernelAudioDevice;
     if (kernelAudio) {
         kernelAudio->setOwner(this);
@@ -793,6 +775,7 @@ bool LatSOFAudioDevice::start(IOService *provider) {
             kernelAudio->release(); kernelAudio = nullptr;
         }
         if (!kernelAudio) {
+            setProperty("Status", "FAILED: Core Audio publication");
             IOLog("LatSOF: kernel audio device FAILED to publish\n");
         } else {
             IOLog("LatSOF: kernel audio device published\n");
@@ -1075,42 +1058,63 @@ bool LatSOFAudioDevice::initRT5682() {
 
 // ==================== DSP Init (called from start and wake) ====================
 
+// SOF IPC3 DMIC layout. The Ubuntu topology matching this board supplies the
+// clocks, controller enables and 200 ms unmute ramp. NHLT corroborates A/B
+// routing and zero polarity, edge and skew fields.
+struct HpIpc3PdmController {
+    UInt32 reserved0;
+    UInt16 id, enableA, enableB, polarityA, polarityB, edge, skew;
+    UInt16 reserved[3];
+} __attribute__((packed, aligned(4)));
+
+struct HpIpc3DmicConfig {
+    UInt32 size, command, type, index;
+    UInt16 format;
+    UInt8 group, flags;
+    UInt32 reserved[8];
+    UInt32 dmicHeader, driverVersion, clockMin, clockMax, rate, reserved1;
+    UInt16 fifoBits, fifoBitsB, dutyMin, dutyMax;
+    UInt32 activeControllers, wakeUpTime, minClockOnTime, unmuteRamp;
+    UInt32 reserved2[5];
+    HpIpc3PdmController pdm[4];
+} __attribute__((packed, aligned(4)));
+
+static_assert(sizeof(HpIpc3PdmController) == 24);
+static_assert(sizeof(HpIpc3DmicConfig) == 216);
+static_assert(__builtin_offsetof(HpIpc3DmicConfig, dmicHeader) == 52);
+static_assert(__builtin_offsetof(HpIpc3DmicConfig, pdm) == 120);
+static_assert(kLatSOF_CapHdaFormat == 0x0043 && kLatSOF_CapBytesPerFrame == 16);
+
+static HpIpc3DmicConfig hpDmicConfig() {
+    HpIpc3DmicConfig config = {};
+    config.size = sizeof(config);
+    config.command = 0x80010000; // SOF_IPC_DAI_CONFIG
+    config.type = DAI_DMIC;
+    // The topology link leaves format and the deprecated fifoBitsB field zero.
+    config.flags = 1;  // SOF_DAI_CONFIG_FLAGS_HW_PARAMS
+    config.driverVersion = 1;
+    config.clockMin = 2400000;
+    config.clockMax = 4800000;
+    config.rate = kLatSOF_CapRate;
+    config.fifoBits = kLatSOF_CapSampleBytes * 8;
+    config.dutyMin = 40;
+    config.dutyMax = 60;
+    config.activeControllers = 2;
+    config.unmuteRamp = 200;
+    for (UInt16 id = 0; id < config.activeControllers; ++id) {
+        config.pdm[id].id = id;
+        config.pdm[id].enableA = 1;
+        config.pdm[id].enableB = 1;
+    }
+    return config;
+}
+
 bool LatSOFAudioDevice::initDSP() {
     volatile UInt8 *hda = hdaBase;
     volatile UInt8 *dsp = dspBase;
     if (!hda || !dsp) return false;
 
-    // LATITUDE FORK patch-17: restore D0 before reading anything.
-    // Our sleep path lets IOKit PM drop this function to D3 and expects wake
-    // to rebuild. But AppleHDA owns the device, so nobody puts it back in D0
-    // on our schedule — and a D3 function does not answer memory cycles at
-    // all, so every read is 0xFFFF and no amount of waiting helps (patch-15
-    // waited its full 3 s and still saw all-ones while AppleHDA's speakers
-    // worked fine). setMemoryEnable/setBusMasterEnable are command-register
-    // bits and cannot fix this on their own. So: find the PCI Power
-    // Management capability and put the function back in D0 ourselves.
-    // No-op when already in D0, which is every normal boot.
-    if (pciDevice) {
-        UInt8 pmCap = 0;
-        if (pciDevice->configRead16(0x06) & 0x0010) {   // capability list present
-            UInt8 off = pciDevice->configRead8(0x34) & 0xFC;
-            for (int g = 0; g < 48 && off >= 0x40; g++) {
-                if (pciDevice->configRead8(off) == 0x01) { pmCap = off; break; }
-                off = pciDevice->configRead8(off + 1) & 0xFC;
-            }
-        }
-        UInt16 pmcs = pmCap ? pciDevice->configRead16(pmCap + 4) : 0;
-        if (pmCap && (pmcs & 0x3) != 0) {
-            pciDevice->configWrite16(pmCap + 4, (UInt16)(pmcs & ~0x3));
-            IOSleep(10);                                // PCI spec D3hot->D0 recovery
-        }
-        pciDevice->setMemoryEnable(true);
-        pciDevice->setBusMasterEnable(true);
-        { char p[72];
-          snprintf(p, sizeof(p), "pmcap=0x%02x pmcs=0x%04x after=0x%04x",
-                   pmCap, pmcs, pmCap ? pciDevice->configRead16(pmCap + 4) : 0);
-          setProperty("PCI-Power", p); }
-    }
+    // Leave power and PCI decoding under the HDA driver's control.
 
     // LATITUDE FORK patch-15: never trust registers that read all-ones.
     // At boot the PCI family may not have enabled memory decode yet; at
@@ -1151,7 +1155,11 @@ bool LatSOFAudioDevice::initDSP() {
             tries++;
         }
         bool linkUp = (rd32(hda, HDA_GCTL) & 1U) != 0;
-        if (linkUp) IOSleep(750);
+        if (!linkUp) {
+            setProperty("Status", "FAILED: AppleHDA has not initialized the link");
+            return false;
+        }
+        IOSleep(750);
         { char h[56];
           snprintf(h, sizeof(h), "crst=%d tries=%d ms=%d",
                    linkUp ? 1 : 0, tries, tries * 10 + (linkUp ? 750 : 0));
@@ -1160,7 +1168,13 @@ bool LatSOFAudioDevice::initDSP() {
 
     {
         UInt64 dspLen = dspBarMap->getLength();
-        UInt16 gcap = rd16(hda, HDA_GCAP);
+        UInt16 gcap = 0;
+        const int loaderState = outputSdBusyState(hda, &gcap);
+        if (loaderState != 0) {
+            gWakeReinitPending = loaderState > 0;
+            setProperty("Status", "deferred: HDA loader unavailable");
+            return false;
+        }
         int numISS = (gcap >> 8) & 0xF;
         int numOSS = (gcap >> 12) & 0xF;
         { char d[64]; snprintf(d, sizeof(d), "GCAP=0x%04x ISS=%d OSS=%d sIdx=%d",
@@ -1181,55 +1195,17 @@ bool LatSOFAudioDevice::initDSP() {
         UInt32 numBdl = 0;
         bool fwLoaded = false;
 
-        // EM2: set bit 14 to match Linux
-        wr32(hda, HDA_VS_EM2, rd32(hda, HDA_VS_EM2) | 0x4000);
-        IODelay(100);
-
-        // ==================== HDA CONTROLLER INIT (match Linux hda_dsp_ctrl_init_chip) =========
-        // Disable misc clock gating during init (PCI CGCTL bit 6)
-        { UInt8 cgctl = pciDevice->configRead8(0x48);
-          pciDevice->configWrite8(0x48, cgctl & ~(1U << 6)); }
-
-        // Clear WAKESTS if controller not in reset
-        if (rd32(hda, HDA_GCTL) & 1)
-            wr32(hda, 0x0E, 0xFFFF);  // WAKESTS = SOF_HDA_WAKESTS_INT_MASK
-
-        // LATITUDE FORK: GCTL global controller reset REMOVED.
-        // AppleHDA has already brought the controller out of reset and is
-        // actively using it; resetting here would drop its streams.
-        // If firmware load fails, this is the first thing to revisit.
-
-        // LATITUDE FORK: surgical replacement for the reference's global init.
-        // The original cleared status for EVERY stream and blind-wrote INTCTL,
-        // which would clobber AppleHDA's stream 0 and its interrupt enables.
-        // We touch only our own loader stream and read-modify-write INTCTL.
-        {
-            const UInt32 kLoaderStream = 1;   // SD0 belongs to AppleHDA
-            UInt32 sdOff = SD_BASE + kLoaderStream * SD_SIZE;
-            // patch-26: wr8, not wr32 — SDSTS is a byte register at +0x03,
-            // and the old 32-bit write was misaligned, spanning into the
-            // neighbouring read-only bytes. Worked on this chipset; still
-            // wrong. streamReset() has always used wr8 here.
-            wr8(hda, sdOff + SD_REG_STS, 0x1C);           // our stream only
-            // patch-26: the INTCTL GIE/CIE enable that used to follow is
-            // deleted. Since patch-18 removed IOCE/SIE from the loader,
-            // nothing on our side services or needs any HDA interrupt —
-            // poll-only means poll-only at the controller level too. Setting
-            // the global enables was harmless only while AppleHDA also had
-            // them set; if a retry fired while AppleHDA was mid-restore with
-            // GIE deliberately clear, we would have un-gated its latched
-            // interrupts at a moment the owner did not expect.
-        }
-
-        // Re-enable misc clock gating (PCI CGCTL bit 6)
-        { UInt8 cgctl = pciDevice->configRead8(0x48);
-          pciDevice->configWrite8(0x48, cgctl | (1U << 6)); }
+        // Skip controller-wide wake-status and clock-gating writes on the shared HDA function.
 
         // ==================== FIRMWARE LOADING ====================
 
-        UInt32 extSig = *(UInt32 *)sof_fw_data;
+        if (fwSize < 8) {
+            setProperty("Status", "FAILED: truncated SOF firmware");
+            goto done;
+        }
+        UInt32 extSig = *(const UInt32 *)sof_fw_data;
         if (extSig == 0x6e614d58) // 'XMan'
-            payloadOffset = *(UInt32 *)(sof_fw_data + 4);
+            payloadOffset = *(const UInt32 *)(sof_fw_data + 4);
         payloadSize = fwSize - payloadOffset;
 
         if (payloadOffset >= fwSize || payloadSize == 0) {
@@ -1243,25 +1219,38 @@ bool LatSOFAudioDevice::initDSP() {
         wr32(dsp, DSP_ADSPCS, rd32(dsp, DSP_ADSPCS) | ADSPCS_SPA(0xF));
         if (!poll32(dsp, DSP_ADSPCS, ADSPCS_CPA(0xF), ADSPCS_CPA(0xF), 50000)) {
             setProperty("Status", "FAILED: core power"), IOLog("LatSOF: %s\n", "FAILED: core power");
-            goto done;
+            goto cleanup;
         }
 
         // Allocate FW DMA buffers
         fwBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
             kIOMemoryPhysicallyContiguous | kIODirectionInOut, payloadSize, 0xFFFFFFFFFFFFF000ULL);
-        if (!fwBuf) { setProperty("Status", "FAILED: FW alloc"), IOLog("LatSOF: %s\n", "FAILED: FW alloc"); goto done; }
-        fwBuf->prepare();
+        if (!fwBuf) { setProperty("Status", "FAILED: FW alloc"), IOLog("LatSOF: %s\n", "FAILED: FW alloc"); goto cleanup; }
+        if (fwBuf->prepare() != kIOReturnSuccess) {
+            fwBuf->release();
+            fwBuf = nullptr;
+            setProperty("Status", "FAILED: FW DMA prepare");
+            goto cleanup;
+        }
         memcpy(fwBuf->getBytesNoCopy(), sof_fw_data + payloadOffset, payloadSize);
 
         numBdl = (payloadSize + PAGE_SIZE - 1) / PAGE_SIZE;
-        if (numBdl > 256) numBdl = 256;
+        if (numBdl > 256) {
+            setProperty("Status", "FAILED: FW DMA descriptor limit");
+            goto cleanup;
+        }
         {
             UInt32 bdlSize = ((numBdl * 16) + 127) & ~127U;
             bdlBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
                 kIOMemoryPhysicallyContiguous | kIODirectionInOut, bdlSize, 0xFFFFFFFFFFFFFF80ULL);
             if (!bdlBuf) { fwBuf->complete(); fwBuf->release(); fwBuf = nullptr;
                            setProperty("Status", "FAILED: BDL alloc"), IOLog("LatSOF: %s\n", "FAILED: BDL alloc"); goto done; }
-            bdlBuf->prepare();
+            if (bdlBuf->prepare() != kIOReturnSuccess) {
+                bdlBuf->release();
+                bdlBuf = nullptr;
+                setProperty("Status", "FAILED: FW BDL prepare");
+                goto cleanup;
+            }
             HdaBdlEntry *bdl = (HdaBdlEntry *)bdlBuf->getBytesNoCopy();
             memset(bdl, 0, bdlSize);
             UInt32 rem = payloadSize; IOByteCount boff = 0;
@@ -1279,48 +1268,43 @@ bool LatSOFAudioDevice::initDSP() {
         }
         IOPhysicalAddress bdlPhys = bdlBuf->getPhysicalAddress();
 
-        // Find PP, SPIB, and ML capabilities
+        // Follow the HDA linked capabilities list instead of scanning MMIO.
         UInt32 mlCap = 0;
         {
-            UInt32 hdaLen = (UInt32)hdaBarMap->getLength();
-            for (UInt32 o = 0x500; o < hdaLen && o < 0x2000; o += 0x10) {
-                UInt16 capId = (rd32(hda, o) >> 16) & 0xFFF;
-                if (capId == HDA_CAP_ML_ID && !mlCap) mlCap = o;
-                if (capId == HDA_CAP_PP_ID && !ppCap) ppCap = o;
-                if (capId == HDA_CAP_SPIB_ID && !spibCap) spibCap = o;
+            const UInt32 hdaLen = (UInt32)hdaBarMap->getLength();
+            UInt32 offset = rd16(hda, 0x14); // LLCH
+            for (unsigned i = 0; i < 10 && offset >= 0x100 &&
+                 !(offset & 3U) && offset <= hdaLen - 4; ++i) {
+                const UInt32 header = rd32(hda, offset);
+                if (!header || header == 0xFFFFFFFF) break;
+                const UInt32 id = (header >> 16) & 0xFFF;
+                if (id == HDA_CAP_ML_ID && !mlCap) mlCap = offset;
+                if (id == HDA_CAP_PP_ID && !ppCap && offset <= hdaLen - 8) ppCap = offset;
+                if (id == HDA_CAP_SPIB_ID && !spibCap &&
+                    offset <= hdaLen - (0x0C + (UInt32)sIdx * 8)) spibCap = offset;
+                offset = header & 0xFFFF;
             }
         }
 
-        // review 1 Aug round 4: the preflight classified this descriptor
-        // >=750 ms ago (settle + firmware waits) — AppleHDA may have begun
-        // playback since. Re-classify at the last instant BEFORE the
-        // snapshot, shrinking the check-to-use window to microseconds.
-        // RUN always bails (the instant-loud-static case); a PROGRAMMED
-        // descriptor bails only while borrow patience remains — once the
-        // retry engine has decided borrow-anyway (patience exhausted),
-        // passing it here is what keeps the mic recoverable at all, since
-        // SD7 stays programmed forever after AppleHDA's first playback.
-        //
-        // Placed before the snapshot deliberately: `goto cleanup` then frees
-        // fwBuf/bdlBuf and re-masks the DSP interrupts like every other exit,
-        // while sdRestore no-ops on the still-invalid snapshot — so the bail
-        // writes NOTHING to a descriptor that is not ours. (Bailing after the
-        // snapshot would either leak both firmware buffers or, via cleanup,
-        // run streamReset on AppleHDA's live stream: the exact harm this
-        // check exists to prevent.)
+        // Recheck immediately before snapshot. Programmed descriptors stay with AppleHDA.
         {
             int st2 = outputSdBusyState(hda);
-            if (st2 == 1 || (st2 == 2 && (gStrictBorrow || gHotRecovery) &&
-                             gProgrammedWaits <= kProgrammedWaitRounds)) {
-                gWakeReinitPending = true;
+            if (st2 != 0) {
+                gWakeReinitPending = st2 > 0;
                 setProperty("Status", "deferred: output became busy before borrow");
                 IOLog("LatSOF: output became %s between preflight and borrow "
                       "— deferring\n", (st2 == 1) ? "RUNNING" : "programmed");
                 goto cleanup;
             }
+            if (!ppCap || !spibCap ||
+                (rd32(hda, ppCap + PP_PPCTL) & (1U << sIdx)) ||
+                (rd32(hda, spibCap + 0x04) & (1U << sIdx))) {
+                setProperty("Status", "FAILED: loader PP/SPIB unavailable or in use");
+                goto cleanup;
+            }
         }
 
-        // PPCTL: PIE + GPROCEN + decouple the loader streams.
+        // Enable processing for the loader stream and snapshot the bits we own.
         // LATITUDE FORK: the reference also set (1U << capIdx) here, relying
         // on the member's constructor value — capIdx isn't assigned until
         // ~270 lines later, so this decoupled AppleHDA's SD0 and never SD1.
@@ -1346,7 +1330,7 @@ bool LatSOFAudioDevice::initDSP() {
         // register and so erased AppleHDA's decouple bits outright.
         if (ppCap)
             wr32(hda, ppCap + PP_PPCTL,
-                 snap.ppctl | (1U << 31) | PP_PPCTL_GPROCEN | (1U << sIdx) | (1U << (sIdx + 1)));
+                 snap.ppctl | PP_PPCTL_GPROCEN | (1U << sIdx));
 
         // Program code loader stream
         streamReset(hda, sd);
@@ -1390,8 +1374,8 @@ bool LatSOFAudioDevice::initDSP() {
         { UInt32 a = rd32(dsp, DSP_ADSPCS);
           a |= ADSPCS_CRST(0xE) | ADSPCS_CSTALL(0xE); a &= ~ADSPCS_SPA(0xE);
           wr32(dsp, DSP_ADSPCS, a); }
+        wr32(dsp, DSP_ADSPIC, 0);
         wr32(dsp, IPC_HIPCCTL, 0x03);
-        wr32(dsp, DSP_ADSPIC, rd32(dsp, DSP_ADSPIC) | 0x01);
 
         // Wait INIT_DONE → Start DMA → Wait FW_ENTERED
         { bool ok = false;
@@ -1448,6 +1432,10 @@ bool LatSOFAudioDevice::initDSP() {
               IOSleep(1);
           }
           setProperty("FW-Ready", ready ? "OK" : "TIMEOUT");
+          if (!ready) {
+              setProperty("Status", "FAILED: FW_READY timeout");
+              goto cleanup;
+          }
         }
 
         if (dspLen >= MBOX_UPLINK + 256) {
@@ -1513,6 +1501,10 @@ bool LatSOFAudioDevice::initDSP() {
                 // Linux SRAM dump shows IPC messages at 0x82000
                 // CML SOF mailbox: inbox=SRAM_WIN0+0x1000, outbox=SRAM_WIN0+0x2000
                 if (!outboxOff) outboxOff = 0x82000;
+                if ((outboxOff & 3U) || outboxOff > dspLen - 256) {
+                    setProperty("Status", "FAILED: invalid IPC outbox");
+                    goto cleanup;
+                }
                 {
                     char ch[96];
                     snprintf(ch, sizeof(ch), "inbox=0x%x outbox=0x%x (%s)",
@@ -1588,7 +1580,7 @@ bool LatSOFAudioDevice::initDSP() {
                 { struct { UInt32 size, cmd, id, type, pipeline_id, core, ext,
                            buf_size, caps, flags, reserved; } __attribute__((packed)) m = {
                       44, 0x30200000, PIPE3_BUF0_ID, COMP_BUFFER, PIPE3_ID, 0, 0,
-                      9600, 0x71, 0, 0 };
+                      19200, 0x71, 0, 0 };
                   countIpc(sendIpc(&m, sizeof(m))); }
                 { UInt32 m[76/4] = {}; m[0]=76; m[1]=0x30010000; m[2]=PIPE3_HOST_ID;
                   m[3]=COMP_HOST; m[4]=PIPE3_ID; m[7]=36; m[9]=2; m[10]=2;
@@ -1599,27 +1591,8 @@ bool LatSOFAudioDevice::initDSP() {
                   m[12]=FRAME_S32; m[16]=DIR_CAPTURE;
                   m[17]=0; m[18]=DAI_DMIC;
                   countIpc(sendIpc(m, 80)); }
-                // DAI_CONFIG for DMIC0 — match Linux kprobe [42] exactly
-                { UInt8 m[216] = {};
-                  *(UInt32*)(m+0)=216; *(UInt32*)(m+4)=0x80010000;
-                  *(UInt32*)(m+8)=DAI_DMIC; *(UInt32*)(m+12)=0;
-                  *(UInt16*)(m+16)=6; // SOF_DAI_FMT_PDM
-                  UInt8 *d=m+52;
-                  // Match Linux: hdr.size=0, pdmclk_min=2400000
-                  *(UInt32*)(d+0)=0;         // hdr.size (Linux=0, was 164)
-                  *(UInt32*)(d+4)=1;         // driver_ipc_version
-                  *(UInt32*)(d+8)=2400000;   // pdmclk_min (Linux=2400000, was 500000)
-                  *(UInt32*)(d+12)=4800000;  // pdmclk_max
-                  *(UInt32*)(d+16)=48000;    // fifo_fs
-                  *(UInt16*)(d+24)=32; *(UInt16*)(d+26)=32; // fifo_bits, fifo_bits_b
-                  *(UInt16*)(d+28)=40; *(UInt16*)(d+30)=60; // duty_min, duty_max
-                  *(UInt32*)(d+32)=1;        // LATITUDE FORK: 1 PDM controller (2 mics)
-                  *(UInt32*)(d+44)=400;      // wake_up_time (Linux data[24]=0x190)
-                  // PDM0 at DMIC+72 (DAI_CONFIG offset 124)
-                  UInt8 *p0=m+124;
-                  *(UInt16*)(p0+0)=0; *(UInt16*)(p0+2)=1; *(UInt16*)(p0+4)=1; // id=0, mic_a=1, mic_b=1
-                  // LATITUDE FORK: PDM1 removed — this board has one PDM controller
-                  countIpc(sendIpc(m, 216)); }
+                const auto dmicConfig = hpDmicConfig();
+                countIpc(sendIpc(&dmicConfig, sizeof(dmicConfig)));
                 { struct { UInt32 s,c,src,dst; } __attribute__((packed)) conn[] = {
                       {16, 0x30030000, PIPE3_DAI_ID, PIPE3_BUF0_ID},
                       {16, 0x30030000, PIPE3_BUF0_ID, PIPE3_HOST_ID} };
@@ -1639,16 +1612,10 @@ bool LatSOFAudioDevice::initDSP() {
                   setProperty("PM", pmstr);
                 }
 
-                // LATITUDE FORK patch-27b: a firmware that reaches FW_READY
-                // but acknowledges ZERO pipeline IPCs has a dead runtime
-                // mailbox — capture can never work on it. Declaring success
-                // here fed an unbounded recovery loop: the rebuild "passed",
-                // the re-arm timed out, and the retry budget reset forever.
-                // Fail the init instead; hwReady stays false, the retry
-                // engine's 12-try budget counts, and give-up stays reachable.
-                if (ipcOk == 0) {
-                    setProperty("Status", "FAILED: runtime IPC dead"),
-                        IOLog("LatSOF: %s\n", "FAILED: runtime IPC dead");
+                // Require every capture topology IPC before publishing the hardware as ready.
+                if (ipcFail != 0) {
+                    setProperty("Status", "FAILED: DMIC topology IPC"),
+                        IOLog("LatSOF: %s\n", "FAILED: DMIC topology IPC");
                     goto cleanup;
                 }
 
@@ -1656,19 +1623,10 @@ bool LatSOFAudioDevice::initDSP() {
                 hdaBase = hda; dspBase = dsp;
                 this->ppCap = ppCap; this->spibCap = spibCap; this->mlCap = mlCap;
                 this->sIdx = sIdx; this->sTag = sTag; this->sd = sd;
-                // patch-32: capture moved SD1 -> SD6 (last input stream).
-                // SD1 was chosen when AppleHDA had at most ONE input engine
-                // (SD0). Layout 92 brought back TWO (IMic + Lini), and
-                // selecting the second one runs a real DMA stream on the
-                // next free input SD even though the codec pin is dead —
-                // trampling a capture stream parked on SD1. Field failure
-                // 2 Aug 01:20: switch input to Line In -> our capture stop
-                // IPC timed out -> 12 failed rebuilds -> mic dead until
-                // sleep. GCAP says 7 input streams (SD0-SD6); AppleHDA
-                // allocates from the bottom, so SD6 collides only if seven
-                // input engines run at once. Tag follows idx+1 convention.
-                this->capIdx = 6; this->capTag = 7;
-                this->capSd = SD_BASE + 6 * SD_SIZE;
+                // Prefer the highest input descriptor, then check it before programming.
+                this->capIdx = numISS - 1;
+                this->capTag = numISS;
+                this->capSd = SD_BASE + (UInt32)capIdx * SD_SIZE;
                 this->outboxOff = outboxOff;
                 hwReady = true; isPlaying = false; isCapturing = false; activePlaybackHost = PIPE1_HOST_ID;
 
@@ -1704,7 +1662,7 @@ bool LatSOFAudioDevice::initDSP() {
                 if (!capDmaBuf) {
                     capDmaBuf = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(
                         kernel_task, kIOMemoryPhysicallyContiguous | kIODirectionInOut,
-                        kLatSOF_CapBufferSize, 0xFFFFFFFFFFFFF000ULL);
+                        kLatSOF_CapBufferSize, 0x00000000FFFFF000ULL);
                     if (capDmaBuf) capDmaBuf->prepare();
                 }
                 if (capDmaBuf) bzero(capDmaBuf->getBytesNoCopy(), kLatSOF_CapBufferSize);
@@ -1728,7 +1686,7 @@ bool LatSOFAudioDevice::initDSP() {
                             UInt32 chunk = (crem > PAGE_SIZE) ? PAGE_SIZE : crem;
                             cbdl[i].addrLow = (UInt32)(cphys & 0xFFFFFFFF);
                             cbdl[i].addrHigh = (UInt32)(cphys >> 32);
-                            cbdl[i].size = chunk; cbdl[i].ioc = 1;
+                            cbdl[i].size = chunk; cbdl[i].ioc = 0;
                             crem -= chunk; cphys += chunk;
                         }
                     }
@@ -1736,21 +1694,14 @@ bool LatSOFAudioDevice::initDSP() {
                 // LATITUDE FORK: MAX98357A GPIO removed (no such amp)
 
 
-                // Initialize RT5682 AFTER all pipelines (SSP0 DAI_CONFIG enables MCLK)
-                initRT5682();
-
-                // PCM_PARAMS will be sent in startPlayback() — NOT here.
-                // Sending it twice causes firmware to reject the second one.
-setProperty("Status", "Ready for UserClient"), IOLog("LatSOF: %s\n", "Ready for UserClient");
-
-            done_inner: ;
             } else {
                 wr32(dsp, IPC_HIPCTDR, rd32(dsp, IPC_HIPCTDR) | IPC_BUSY);
                 wr32(dsp, IPC_HIPCTDA, IPC_DONE);
             }
         }
 
-        setProperty("Status", "OK"), IOLog("LatSOF: %s\n", "OK");
+        if (!hwReady) setProperty("Status", "FAILED: invalid FW_READY");
+        else setProperty("Status", "OK");
 
     cleanup:
         // LATITUDE FORK patch-26: restore the poll-only doctrine — HERE, not
@@ -1937,24 +1888,15 @@ void LatSOFAudioDevice::scheduleDspRecovery(const char *reason) {
     // patch-27b: bounded episodes. Without this cap, a rebuild that
     // "succeeds" against a dead mailbox followed by a failed re-arm would
     // re-enter here and reset the retry budget indefinitely.
+    hwReady = false;
     if (++gRecoveryEpisodes > 3) {
         setProperty("DSP-Recovery", "exhausted (3 episodes) — sleep/wake to retry");
         IOLog("LatSOF: DSP recovery exhausted; deferring to next sleep/wake\n");
         return;
     }
-    hwReady = false;
     gWakeReinitPending = true;
     gWakeTries = 0;
     gWakeTickDivider = 0;
-    gHotRecovery = true;      // patch-32: IPC-timeout context — borrow patiently
-    // patch-30a: patience is PER EPISODE, not per boot. Without this reset a
-    // recovery that follows an earlier one starts with zero patience, borrows
-    // AppleHDA's programmed descriptor immediately, and the firmware load then
-    // fails — observed 29 Jul as 12 consecutive "FAILED: ROM IPC timeout" with
-    // SD-Borrow showing fmt=0x0031 bdl=0x2be41000, i.e. a stream that was very
-    // much in use. Every retry engine here refills its own budget; this one
-    // must too.
-    gProgrammedWaits = 0;
     setProperty("DSP-Recovery", reason);
     IOLog("LatSOF: DSP recovery scheduled: %s\n", reason);
 }
@@ -1997,12 +1939,6 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
         // turned one transient remap failure into a driver that was dead
         // until reboot, while its own comment promised "next wake retries".
         if (!hwReady && pciDevice && gSleptOnce) {
-            // PCI power cycle
-            pciDevice->setBusMasterEnable(true);
-            pciDevice->setMemoryEnable(true);
-            UInt8 tcsel = pciDevice->configRead8(PCI_TCSEL);
-            pciDevice->configWrite8(PCI_TCSEL, tcsel & ~0x07);
-
             // LATITUDE FORK patch-21: rebuild the BAR mappings before any
             // register access. IOKit can tear down this device's memory
             // mappings across a power transition, leaving hdaBase/dspBase
@@ -2016,7 +1952,8 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
                 if (dspBarMap) { dspBarMap->release(); dspBarMap = nullptr; }
                 hdaBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
                 dspBarMap = pciDevice->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress4);
-                if (!hdaBarMap || !dspBarMap) {
+                if (!hdaBarMap || !dspBarMap ||
+                    hdaBarMap->getLength() < 0x4000 || dspBarMap->getLength() < 0x100000) {
                     setProperty("BAR-Remap", "FAILED"),
                         IOLog("LatSOF: %s\n", "FAILED: BAR remap on wake");
                     hdaBase = nullptr; dspBase = nullptr;
@@ -2037,8 +1974,6 @@ IOReturn LatSOFAudioDevice::setPowerStateGated(unsigned long powerStateOrdinal) 
             gWakeTries = 0;
             gWakeTickDivider = 0;
             gRecoveryEpisodes = 0;   // patch-27b: each wake grants a fresh budget
-            gProgrammedWaits  = 0;   // patch-30a: and a fresh borrow patience
-            gHotRecovery      = false; // patch-32: cold wake — boot-arg policy
             // review 1 Aug: like every other retry engine here. A wake cycle
             // that skips resumeAudioEngine (engine parked in Resumed after a
             // failed attempt — family only pauses Running engines) would
@@ -2199,7 +2134,7 @@ void LatSOFAudioDevice::stop(IOService *provider) {
     if (i2cPciDevice) { i2cPciDevice->release(); i2cPciDevice = nullptr; }
     if (hdaBarMap) { hdaBarMap->release(); hdaBarMap = nullptr; }
     if (dspBarMap) { dspBarMap->release(); dspBarMap = nullptr; }
-    if (pciDevice) { pciDevice->close(this); pciDevice->release(); pciDevice = nullptr; }
+    if (pciDevice) { pciDevice->release(); pciDevice = nullptr; }
     IOService::stop(provider);
 }
 
@@ -2224,37 +2159,11 @@ void LatSOFAudioDevice::jackPoll(IOTimerEventSource *sender) {
             // replugging the jack does not clear. Only a reboot did.
             //
             // So a programmed descriptor also means "not ours to take".
-            // It cannot mean "wait forever", though: AppleHDA leaves SD7
-            // programmed after its first playback, so an unbounded wait
-            // would mean no microphone for the rest of the session. Wait
-            // a bounded number of rounds for a genuinely clean window,
-            // then take it anyway — a mic that works with a risk of
-            // static beats a mic that never comes back.
-            //
-            // Classification comes from outputSdBusyState — the same
-            // predicate the load path uses, so the two cannot disagree.
-            // Patience and borrow-anyway POLICY stay here; the helper only
-            // answers "what state is the descriptor in".
             UInt16 g = 0;
-            int st = outputSdBusyState(hdaBase, &g);
-            bool decoding = (st != -1);
-            bool busy = (st == 1), programmed = false;
-            if (!busy && decoding && (gStrictBorrow || gHotRecovery)) {
-                if (st == 2) {
-                    if (++gProgrammedWaits <= kProgrammedWaitRounds) {
-                        programmed = true;
-                        busy = true;              // defer this round
-                    } else if (gProgrammedWaits >= kProgrammedWaitRounds + 1) {
-                        setProperty("Borrow-Warning",
-                            "SD7 still programmed after wait — borrowing anyway");
-                        IOLog("LatSOF: SD7 still programmed after %d rounds; "
-                              "borrowing anyway (playback may glitch)\n",
-                              kProgrammedWaitRounds);
-                    }
-                } else {
-                    gProgrammedWaits = 0;         // clean window — reset patience
-                }
-            }
+            const int st = outputSdBusyState(hdaBase, &g);
+            const bool decoding = (st != -1);
+            const bool programmed = (st == 2);
+            const bool busy = (st == 1 || programmed);
             // patch-26: only a real init attempt consumes the retry budget.
             // gWakeTries++ used to run before the busy check, so music
             // auto-resuming at wake for ~18 s burned all 12 rounds on "busy"
@@ -2761,9 +2670,7 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
             gWakeReinitPending = true;
             gWakeTries = 0;
             gWakeTickDivider = 0;
-            gProgrammedWaits = 0;
             gRecoveryEpisodes = 0;
-            gHotRecovery = true;      // session churn context: borrow patiently
             setProperty("Wake-Retry", "re-armed by capture demand");
             IOLog("LatSOF: %s\n",
                   "capture demanded while DSP down — re-arming rebuild");
@@ -2772,10 +2679,27 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
     }
     if (isCapturing) return kIOReturnSuccess;
 
+    const UInt32 bit = 1U << capIdx;
+    const UInt32 ppctl = rd32(hdaBase, ppCap + PP_PPCTL);
+    if (streamIsProgrammed(hdaBase, capSd) ||
+        (rd32(hdaBase, HDA_INTCTL) & bit) || (ppctl & bit) ||
+        (rd32(hdaBase, spibCap + 0x04) & bit)) {
+        setProperty("Capture-Error", "HDA input descriptor is already in use");
+        return kIOReturnBusy;
+    }
+    for (int i = 0; i < capIdx; ++i) {
+        const UInt32 other = SD_BASE + (UInt32)i * SD_SIZE;
+        if ((rd8(hdaBase, other + 2) >> 4) == (UInt32)capTag) {
+            setProperty("Capture-Error", "HDA input stream tag is already in use");
+            return kIOReturnBusy;
+        }
+    }
+    capEnabledProcessing = !(ppctl & PP_PPCTL_GPROCEN);
+
     UInt32 numBdl = (kLatSOF_CapBufferSize + PAGE_SIZE - 1) / PAGE_SIZE;
     UInt32 paramsErr = 0, trigErr = 0, posnOff = 0;  // LATITUDE FORK: real IPC replies
 
-    // Enable INTCTL for capture stream
+    // Capture polls its stream position.
     // LATITUDE FORK: poll-only — no stream IRQs. The original enabled
     // INTCTL GIE|CIE|SIE(capIdx) here, but there is no handler and SDSTS is
     // never serviced, so BCIS latched ~94x/sec on the line AppleHDA shares.
@@ -2789,7 +2713,7 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
     // tag-2 data no codec sends — RUN=1, IPCs ack, DPIB pinned at 0.
     // Mirrors startPlaybackGated Step 1b (Linux hda-stream.c:521-523).
     if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
-                    rd32(hdaBase, ppCap + PP_PPCTL) | (1U << capIdx));
+                    rd32(hdaBase, ppCap + PP_PPCTL) | PP_PPCTL_GPROCEN | (1U << capIdx));
 
     // Program HDA capture stream (double reset — Linux hda-stream.c:568-591)
     streamReset(hdaBase, capSd);
@@ -2803,9 +2727,9 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
     // startPlaybackGated Step 2f (Linux hda-stream.c:624-637).
     if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
                     rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
-    wr16(hdaBase, capSd + SD_REG_FMT, 0x0041); // 48kHz 32-bit 2ch
+    wr16(hdaBase, capSd + SD_REG_FMT, kLatSOF_CapHdaFormat);
     if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
-                    rd32(hdaBase, ppCap + PP_PPCTL) | (1U << capIdx));
+                    rd32(hdaBase, ppCap + PP_PPCTL) | PP_PPCTL_GPROCEN | (1U << capIdx));
     wr8(hdaBase, capSd + 2, (UInt8)((capTag & 0xF) << 4));
     // LATITUDE FORK: poll-only — no stream IRQs. Mask IOCE|FEIE|DEIE here
     // instead of enabling them.
@@ -2823,25 +2747,18 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       pcm.buffer.size = kLatSOF_CapBufferSize;
       pcm.direction = DIR_CAPTURE;
       pcm.frame_fmt = FRAME_S32;
-      pcm.rate = 48000;
+      pcm.rate = kLatSOF_CapRate;
       pcm.stream_tag = (UInt16)capTag;
-      pcm.channels = kLatSOF_CapChannels;  // LATITUDE FORK: 2 (see .hpp)
-      pcm.sample_valid_bytes = 4;
-      pcm.sample_container_bytes = 4;
+      pcm.channels = kLatSOF_CapChannels;
+      pcm.sample_valid_bytes = kLatSOF_CapSampleBytes;
+      pcm.sample_container_bytes = kLatSOF_CapSampleBytes;
       pcm.host_period_bytes = kLatSOF_CapBufferSize / 4;  // 4 periods per buffer
       pcm.no_stream_position = 1;  // LATITUDE FORK: we poll DPIB; don't queue unacked posn IPCs
       volatile UInt8 *ob = dspBase + outboxOff;
       for (UInt32 i = 0; i < sizeof(pcm); i += 4) wr32(ob, i, *(UInt32*)((UInt8*)&pcm + i));
       wr32(dspBase, IPC_HIPCIDR, IPC_BUSY);
       if (!poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000)) {
-          // patch-26: re-couple SD1 before bailing. RUN is not set yet on
-          // this path, but the stream was decoupled above; leaving the
-          // PPCTL bit set contradicted the zero-steady-state-footprint
-          // rule and nothing else would ever clear it.
-          if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
-                          rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
-          // Same contract as the not-ready refusal above: the plugin
-          // swallows this return, so a timed-out start is a demand too.
+          releaseCaptureStream();
           gWasCapturing = true;
           // patch-27: a timed-out PCM_PARAMS means the firmware's PCM
           // state is desynced; nothing short of a rebuild recovers it.
@@ -2852,6 +2769,12 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       posnOff   = rd32(ob, 12);          // LATITUDE FORK: reply word 3 is actually the comp_id echoed back (35 = DMIC host component), not a position offset
       wr32(dspBase, IPC_HIPCIDA, rd32(dspBase, IPC_HIPCIDA) | IPC_DONE);
       wr32(dspBase, IPC_HIPCCTL, rd32(dspBase, IPC_HIPCCTL) | 0x02);
+    }
+
+    if (paramsErr != 0) {
+        releaseCaptureStream();
+        scheduleDspRecovery("capture PCM_PARAMS rejected");
+        return kIOReturnIOError;
     }
 
     // Disable SPIB for capture stream (Linux: SPIB not needed for capture)
@@ -2877,17 +2800,7 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       for (UInt32 i = 0; i < 12; i += 4) wr32(ob, i, *(UInt32*)((UInt8*)&m + i));
       wr32(dspBase, IPC_HIPCIDR, IPC_BUSY);
       if (!poll32(dspBase, IPC_HIPCIDA, IPC_DONE, IPC_DONE, 500000)) {
-          // patch-26: RUN was set a few lines up; returning with it still
-          // set left SD1 DMA looping into capDmaBuf with isCapturing ==
-          // false — a state stopCaptureGated's !isCapturing early-return
-          // could never converge, and a wake re-arm hitting this timeout
-          // produced exactly that. Stop the engine and re-couple.
-          wr8(hdaBase, capSd, rd8(hdaBase, capSd) & ~(UInt8)SD_CTL_RUN);
-          wr8(hdaBase, capSd + SD_REG_STS, 0x1C);
-          if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
-                          rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
-          // Same contract as the not-ready refusal above: the plugin
-          // swallows this return, so a timed-out start is a demand too.
+          releaseCaptureStream();
           gWasCapturing = true;
           // patch-27: same rationale as the PCM_PARAMS site above.
           scheduleDspRecovery("capture TRIG_START timeout");
@@ -2896,6 +2809,12 @@ IOReturn LatSOFAudioDevice::startCaptureGated() {
       trigErr = rd32(ob, 8);             // LATITUDE FORK: sof_ipc_reply.error
       wr32(dspBase, IPC_HIPCIDA, rd32(dspBase, IPC_HIPCIDA) | IPC_DONE);
       wr32(dspBase, IPC_HIPCCTL, rd32(dspBase, IPC_HIPCCTL) | 0x02);
+    }
+
+    if (trigErr != 0) {
+        releaseCaptureStream();
+        scheduleDspRecovery("capture TRIG_START rejected");
+        return kIOReturnIOError;
     }
 
     // LATITUDE FORK: one-line state snapshot — read it with
@@ -2962,32 +2881,32 @@ IOReturn LatSOFAudioDevice::stopCaptureGated() {
     sendCapIpc(0x60030000); // PCM_FREE
     if (!stopIpcOk) scheduleDspRecovery("capture stop IPC timeout");
 
-    // LATITUDE FORK: post-run snapshot BEFORE the ring is cleared —
-    // proves whether audio landed independently of any position register.
-    { volatile UInt32 *ring = (volatile UInt32 *)capDmaBuf->getBytesNoCopy();
-      char st[160];
-      snprintf(st, sizeof(st),
-          "dpib=%u lpib=%u sts=0x%02x ring=%08x %08x %08x %08x",
-          rd32(hdaBase, HDA_VS_SDXDPIB_XBASE + HDA_VS_SDXDPIB_XINTERVAL * (UInt32)capIdx),
-          rd32(hdaBase, capSd + 0x04 /* LPIB */),
-          (unsigned)rd8(hdaBase, capSd + SD_REG_STS),
-          (unsigned)ring[0], (unsigned)ring[1], (unsigned)ring[2], (unsigned)ring[3]);
-      setProperty("Capture-Stop", st); }
+    setProperty("Capture-Stop", stopIpcOk ? "OK" : "IPC timeout");
 
-    // LATITUDE FORK: re-couple SD1 so the steady-state PPCTL footprint
-    // is zero again outside a capture run.
-    if (ppCap) wr32(hdaBase, ppCap + PP_PPCTL,
-                    rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx));
-
+    releaseCaptureStream();
     bzero(capDmaBuf->getBytesNoCopy(), kLatSOF_CapBufferSize);
     isCapturing = false;
     return kIOReturnSuccess;
 }
 
+void LatSOFAudioDevice::releaseCaptureStream() {
+    streamReset(hdaBase, capSd);
+    wr32(hdaBase, capSd + SD_REG_BDLPL, 0);
+    wr32(hdaBase, capSd + SD_REG_BDLPU, 0);
+    wr32(hdaBase, capSd + SD_REG_CBL, 0);
+    wr16(hdaBase, capSd + SD_REG_LVI, 0);
+    wr16(hdaBase, capSd + SD_REG_FMT, 0);
+    UInt32 ppctl = rd32(hdaBase, ppCap + PP_PPCTL) & ~(1U << capIdx);
+    if (capEnabledProcessing && !(ppctl & (PP_PPCTL_GPROCEN - 1)))
+        ppctl &= ~PP_PPCTL_GPROCEN;
+    wr32(hdaBase, ppCap + PP_PPCTL, ppctl);
+    capEnabledProcessing = false;
+}
+
 UInt32 LatSOFAudioDevice::getCapturePosition() {
     if (!hwReady) return 0;
     UInt32 dpib = rd32(hdaBase, HDA_VS_SDXDPIB_XBASE + HDA_VS_SDXDPIB_XINTERVAL * (UInt32)capIdx);
-    return dpib / kLatSOF_CapBytesPerFrame;  // 8 bytes/frame (2ch S32)
+    return dpib / kLatSOF_CapBytesPerFrame;
 }
 
 // ==================== Public wrappers (serialize via commandGate) ====================

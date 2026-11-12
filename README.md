@@ -1,5 +1,7 @@
 # LatSOFAudio
 
+> This branch is an untested source port for the HP EliteBook 840 G6 (8086:9DC8 / 103C:8549). See [HP port notes](HP840G6-PORT.md). The README below describes the upstream Dell reference.
+
 Internal microphone driver for the Intel SOF DSP on **Comet Lake** hackintosh
 laptops, tested on the **Dell Latitude 3410** under **macOS Sequoia**.
 
